@@ -71,13 +71,20 @@ SurveySubmission.PendingSurveyRecord = function(surveyRecord, timeToSend,
  */
 SurveySubmission.saveSurveyRecord = function(surveyRecord, tries) {
   tries = tries || 0;
-
-  SurveySubmission.withObjectStore('PendingSurveyRecords', 'readwrite',
+  return SurveySubmission.withObjectStore('PendingSurveyRecords', 'readwrite',
       function(store) {
-    var timeToSend = Date.now() + SurveySubmission.calculateSendingDelay(tries);
-    var pendingSurveyRecord = new SurveySubmission.PendingSurveyRecord(
-        surveyRecord, timeToSend, tries);
-    var request = store.add(pendingSurveyRecord);
+    return new Promise(function(resolve, reject) {
+      var timeToSend = Date.now() + SurveySubmission.calculateSendingDelay(tries);
+      var pendingSurveyRecord = new SurveySubmission.PendingSurveyRecord(
+          surveyRecord, timeToSend, tries);
+      var request = store.add(pendingSurveyRecord);
+      request.onsuccess = function(event) {
+        resolve(true);
+      };
+      request.onerror = function(event) {
+        reject(Error("Failed to save record"));
+      };
+    });
   });
 }
 
@@ -91,27 +98,24 @@ SurveySubmission.calculateSendingDelay = function(tries) {
 }
 
 /**
+ * Triggers processing the submission queue if the alarm is for processing the 
+ * queue.
+ */
+SurveySubmission.processQueueAlarm = function(alarm) {
+  if (alarm.name != SurveySubmission.QUEUE_ALARM_NAME) return;
+  processQueue();
+}
+chrome.alarms.onAlarm.addListener(SurveySubmission.processQueueAlarm);
+
+/**
  * Get all pending surveyRecords with timeToSend less than the current time,
  * and try to send them. If sending succeeds, delete them from the database. If
  * sending fails, update the timeToSend so we try again later.
- * @params {Alarm} alarm The alarm that triggered.
- */
-SurveySubmission.processQueue = function(alarm) {
-  if (alarm.name != SurveySubmission.QUEUE_ALARM_NAME) return;
-
-  function makeSuccessCallback(id) {
-    return function(response) {
-      SurveySubmission.deleteSurvey(id);
-    };
-  }
-
-  function makeErrorCallback(id) {
-    return function(status) {
-      SurveySubmission.updateTimeToSend(id);
-    };
-  }
-
-  SurveySubmission.withObjectStore('PendingSurveyRecords', 'readonly',
+ * @return {Promise} A promise that fulfills after every item processed has been
+ *     updated or deleted.
+ */ 
+SurveySubmission.processQueue = function() {
+  return SurveySubmission.withObjectStore('PendingSurveyRecords', 'readonly',
       function(store) {
     var surveysToSubmit = [];
 
@@ -126,28 +130,38 @@ SurveySubmission.processQueue = function(alarm) {
         });
         cursor.continue();
       } else {
-        // After collecting all the surveys over the cursor, make async calls
-        // to sendSurvey.
-        for (var i = 0; i < surveysToSubmit.length; i++) {
-          var id = surveysToSubmit[i].id;
-          var surveyRecord = surveysToSubmit[i].survey;
-          SurveySubmission.sendSurvey(surveyRecord, makeSuccessCallback(id),
-              makeErrorCallback(id));
-        }
+        // Gather submissions into a single promise that fulfills when all of
+        // the individual submission promises fulfill.
+        return Promise.all(
+          // Map array of surveys to sendSurveyRecord promises
+          surveysToSubmit.map(SurveySubmission.sendSurveyRecord)
+          // Map array of sendSurveyRecord promises to delete or update promises
+            .map(function(submissionPromise) {
+              submissionPromise.then(function(response) {
+                return SurveySubmission.deleteSurveyRecord(id);
+              }, function(error) {
+                return SurveySubmission.updateTimeToSend(id);
+              });
+            });
+        );
       }
     };
   });
 }
-chrome.alarms.onAlarm.addListener(SurveySubmission.processQueue);
 
 /**
  * Delete the survey with the specified key from the database.
  * @param {int} id The ID primary key of survey to delete.
+ * @returns {Promise} 
  */
 SurveySubmission.deleteSurveyRecord = function(id) {
-  SurveySubmission.withObjectStore('PendingSurveyRecords', 'readwrite',
+  return SurveySubmission.withObjectStore('PendingSurveyRecords', 'readwrite',
       function(store) {
-    var request = store.delete(id);
+    return new Promise(function(resolve, reject) {
+      var request = store.delete(id);
+      request.onsuccess = resolve;
+      request.onerror = reject;
+    });
   });
 }
 
@@ -157,39 +171,54 @@ SurveySubmission.deleteSurveyRecord = function(id) {
  * @param {int} id The ID primary key of the survey to update.
  */
 SurveySubmission.updateTimeToSend = function(id) {
-  SurveySubmission.withObjectStore('PendingSurveyRecords', 'readwrite',
+  return SurveySubmission.withObjectStore('PendingSurveyRecords', 'readwrite',
       function(store) {
-    var request = store.get(id);
-    request.onsuccess =  function(event) {
-      var record = event.target.result;
-      record.tries = record.tries + 1;
-      record.timeToSend = Date.now() +
-          SurveySubmission.calculateSendingDelay(record.tries);
-      var request = store.put(record);
-    }
+    return new Promise(function(resolve, reject) {
+      var request = store.get(id);
+      request.onsuccess =  function(event) {
+        var record = event.target.result;
+        record.tries = record.tries + 1;
+        record.timeToSend = Date.now() +
+            SurveySubmission.calculateSendingDelay(record.tries);
+        var request = store.put(record);
+        request.onsuccess = resolve;
+        request.onerror = reject;
+      };
+      request.onerror = reject;
+    });
   });
 }
 
 /**
- * Perform a callback action after opening the database and a given
+ * Perform an action after opening the database and a given
  * object store.
  * @param {string} storeName The name of the object store to open.
  * @param {string} mode The transaction mode ('readwrite' or 'readonly').
- * @param {function(IDBObjectStore)} action 
+ * @param {function(IDBObjectStore)} action A function that acts on the object
+ *     store and returns a promise about its results.
+ * @return {Promise<>} A promise about the results of the action function.
  */
 SurveySubmission.withObjectStore = function(storeName, mode, action) {
-  var request = indexedDB.open(SurveySubmission.DB_NAME,
-      SurveySubmission.DB_VERSION);
-  request.onsuccess = function(event) {
-    var db = event.target.result;
-    var transaction = db.transaction([storeName], mode);
-    var objectStore = transaction.objectStore(storeName);
-    action(objectStore);
-  };
-  request.onerror = function(event) {
-    console.log("Database Error: " + event.target.errorCode);
-  }
-  request.onupgradeneeded = SurveySubmission.setupPendingResponsesDatabase;
+  return new Promise(function(resolve, reject) {
+    var request = indexedDB.open(SurveySubmission.DB_NAME,
+        SurveySubmission.DB_VERSION);
+    request.onsuccess = function(event) {
+      var db = event.target.result;
+      var transaction = db.transaction([storeName], mode);
+      var objectStore = transaction.objectStore(storeName);
+      action(objectStore).then(function(response) {
+        resolve(response);
+      }, function(error) {
+        reject(error);
+      });
+    };
+    request.onerror = function(event) {
+      console.log("Database Error: " + event.target.errorCode);
+      return Promise.reject();
+      reject(event);
+    }
+    request.onupgradeneeded = SurveySubmission.setupPendingResponsesDatabase;
+  });
 }
 
 /**
@@ -208,54 +237,50 @@ SurveySubmission.setupPendingResponsesDatabase = function(event) {
  * Sends a completed survey to the CESP backend via XHR.
  * @param {SurveyRecord} surveyRecord The completed survey to send to the
  *     backend.
- * @param {function(string)} successCallback A function to call on receiving a
- *     successful response (HTTP 204). It should look like
- *     "function(response) {...};" where "response" is the text of the response
- *     (if there is any).
- * @param {function(!number=)} errorCallback A function to call on receiving an
- *     error from the server, or on timing out. It should look like
- *     "function(status) {...};" where "status" is an HTTP status code integer,
- *     if there is one. For a timeout, there is no status.
+ * @return {Promise<string|number>} A promise to the result of the submission.
+ *     When resolved, this will be a string containing the response text. When 
+ *     rejected, this will be the number of the HTTP status code.
  */
-SurveySubmission.sendSurveyRecord = function(surveyRecord, successCallback,
-    errorCallback) {
-  var url = SurveySubmission.SERVER_URL + SurveySubmission.SUBMIT_SURVEY_ACTION;
-  var method = 'POST';
-  var dateTaken = surveyRecord.dateTaken.toISOString();
-  // Get rid of timezone 'Z' on end of ISO String for AppEngine compatibility.
-  if (dateTaken.slice(-1) === 'Z') {
-    dateTaken = dateTaken.slice(0, -1);
-  }
-  var data = {
-    'date_taken': dateTaken,
-    'participant_id': surveyRecord.participantId,
-    'responses': [],
-    'survey_type': surveyRecord.type
-  };
-  for (var i = 0; i < surveyRecord.responses.length; i++) {
-    data.responses.push(surveyRecord.responses[i]);
-  }
-  var xhr = new XMLHttpRequest();
-  function onLoadHandler(event) {
-    if (xhr.readyState === 4) {
-      if (xhr.status === 204) {
-        successCallback(xhr.response);
-      } else {
-        errorCallback(xhr.status);
+SurveySubmission.sendSurveyRecord = function(surveyRecord) {
+  return new Promise(function(resolve, reject) {
+    var url = SurveySubmission.SERVER_URL + SurveySubmission.SUBMIT_SURVEY_ACTION;
+    var method = 'POST';
+    var dateTaken = surveyRecord.dateTaken.toISOString();
+    // Get rid of timezone 'Z' on end of ISO String for AppEngine compatibility.
+    if (dateTaken.slice(-1) === 'Z') {
+      dateTaken = dateTaken.slice(0, -1);
+    }
+    var data = {
+      'date_taken': dateTaken,
+      'participant_id': surveyRecord.participantId,
+      'responses': [],
+      'survey_type': surveyRecord.type
+    };
+    for (var i = 0; i < surveyRecord.responses.length; i++) {
+      data.responses.push(surveyRecord.responses[i]);
+    }
+    var xhr = new XMLHttpRequest();
+    function onLoadHandler(event) {
+      if (xhr.readyState === 4) {
+        if (xhr.status === 204) {
+          resolve(xhr.response);
+        } else {
+          reject(xhr.status);
+        }
       }
     }
-  }
-  function onErrorHandler(event) {
-    errorCallback(xhr.status);
-  }
-  function onTimeoutHandler(event) {
-    errorCallback();
-  }
-  xhr.open(method, url, true);
-  xhr.setRequestHeader('Content-Type', 'application/JSON');
-  xhr.timeout = SurveySubmission.XHR_TIMEOUT;
-  xhr.onload = onLoadHandler;
-  xhr.onerror = onErrorHandler;
-  xhr.ontimeout = onTimeoutHandler;
-  xhr.send(JSON.stringify(data));
+    function onErrorHandler(event) {
+      reject(xhr.status);
+    }
+    function onTimeoutHandler(event) {
+      reject(xhr.status);
+    }
+    xhr.open(method, url, true);
+    xhr.setRequestHeader('Content-Type', 'application/JSON');
+    xhr.timeout = SurveySubmission.XHR_TIMEOUT;
+    xhr.onload = onLoadHandler;
+    xhr.onerror = onErrorHandler;
+    xhr.ontimeout = onTimeoutHandler;
+    xhr.send(JSON.stringify(data));
+  });
 }
